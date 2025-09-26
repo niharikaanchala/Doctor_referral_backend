@@ -10,7 +10,7 @@ router.use("/:doctorId/reviews", reviewRouter);
 router.get("/:id/blocked-dates-with-slots", getBlockedDatesWithSlots);
 
 router.get('/:id/blocked-dates', authenticate, restrict(["patient"]), getBlockedDates);
-router.get('/:id', authenticate, restrict(['patient', 'doctor']), getSingleDoctor)
+router.get('/:id', getSingleDoctor)
 router.get("/:id/available-dates", authenticate, restrict(["patient", "doctor"]), getAvailableDates);
 router.delete('/:id', restrict(['doctor']), deleteDoctor)
 router.post("/:id/available-slots", getAvailableSlotsByDoctorId);
