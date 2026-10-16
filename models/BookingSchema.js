@@ -19,6 +19,21 @@ const doctorResponseSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now }
 });
 
+const prescriptionMedicineSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  dosage: { type: String, default: "" },
+  frequency: { type: String, default: "" },
+  duration: { type: String, default: "" },
+}, { _id: false });
+
+const prescriptionSchema = new mongoose.Schema({
+  diagnosis: { type: String, default: "" },
+  medicines: [prescriptionMedicineSchema],
+  notes: { type: String, default: "" },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date },
+});
+
 const bookingSchema = new mongoose.Schema({
   doctor: {
     type: mongoose.Types.ObjectId,
@@ -47,6 +62,8 @@ const bookingSchema = new mongoose.Schema({
   ],
   reportsHistory: [reportUpdateSchema],
   doctorResponses: [doctorResponseSchema],
+  patientMessages: [doctorResponseSchema],
+  prescriptions: [prescriptionSchema],
   status: {
     type: String,
     enum: ["pending", "approved", "cancelled", "completed"],
@@ -70,6 +87,13 @@ const bookingSchema = new mongoose.Schema({
     type: Object, // or type: mongoose.Schema.Types.Mixed
     default: null,
   },
+  aiStatus: {
+    type: String,
+    enum: ["idle", "processing", "ready", "failed"],
+    default: "idle",
+  },
+  aiStartedAt: { type: Date, default: null },
+  aiError: { type: String, default: "" },
 }, {
   timestamps: true,
   toJSON: { virtuals: true },

@@ -5,6 +5,42 @@ dotenv.config();
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
+const GEMINI_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+];
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const isRetryable = (error) => {
+    const status = error?.response?.status;
+    return status === 429 || status === 503 || status === 500;
+};
+
+const requestGemini = async (model, prompt) => {
+    const response = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+            contents: [
+                {
+                    parts: [{ text: prompt }]
+                }
+            ]
+        },
+        {
+            headers: {
+                "Content-Type": "application/json",
+                "X-goog-api-key": GEMINI_API_KEY
+            },
+            timeout: 60000
+        }
+    );
+    return response;
+};
+
 export const analyzeWithGemini = async ({ user, reports, healthIssues }) => {
 const prompt = `
 You are a senior **Interventional Radiology** AI assistant.
@@ -53,22 +89,29 @@ Respond strictly using the following **JSON format**, and do not include any exp
 
 
     try {
-        const response = await axios.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
-            {
-                contents: [
-                    {
-                        parts: [{ text: prompt }]
-                    }
-                ]
-            },
-            {
-                headers: {
-                    "Content-Type": "application/json",
-                    "X-goog-api-key": GEMINI_API_KEY
+        let response;
+        let lastError;
+
+        for (const model of GEMINI_MODELS) {
+            for (let attempt = 1; attempt <= 2; attempt++) {
+                try {
+                    response = await requestGemini(model, prompt);
+                    console.log(`Gemini analysis succeeded with ${model}`);
+                    lastError = null;
+                    break;
+                } catch (error) {
+                    lastError = error;
+                    console.error(`Gemini ${model} attempt ${attempt} failed:`, error?.response?.data || error.message);
+                    if (!isRetryable(error) || attempt === 2) break;
+                    await sleep(1000 * attempt);
                 }
             }
-        );
+            if (response) break;
+        }
+
+        if (!response) {
+            throw lastError || new Error("No Gemini model responded.");
+        }
 
         const rawText = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
 

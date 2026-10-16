@@ -1,9 +1,11 @@
-import { deleteDoctor, updateDoctor, getAllDoctor, getSingleDoctor, getDoctorProfile, getAvailableDates, filterDoctorAppointments, getAvailableSlots, cancelAppointments, getBlockedDates, getBlockedDatesWithSlots, getAvailableSlotsByDoctorId } from "../controllers/doctorController.js";
+import { deleteDoctor, updateDoctor, getAllDoctor, getSingleDoctor, getDoctorProfile, getAvailableDates, filterDoctorAppointments, getAvailableSlots, cancelAppointments, getBlockedDates, getBlockedDatesWithSlots, getAvailableSlotsByDoctorId, getMyPatients } from "../controllers/doctorController.js";
 import { authenticate, restrict } from "../auth/verifyToken.js";
 import reviewRouter from './review.js'
 import express from "express"
 
 const router = express.Router();
+
+router.get('/my-patients', authenticate, restrict(['doctor']), getMyPatients);
 
 router.use("/:doctorId/reviews", reviewRouter);
 

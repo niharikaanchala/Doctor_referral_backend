@@ -1,10 +1,17 @@
+import mongoose from "mongoose";
 import User from "../models/UserSchema.js";
 import Doctor from "../models/DoctorSchema.js";
 import Booking from "../models/BookingSchema.js";
 import Stripe from "stripe";
 import twilio from 'twilio';
 import dotenv from "dotenv"
-import { analyzeAndStore } from "./aiHelper.js";
+import { queueAnalysis } from "./aiHelper.js";
+
+function applyQueuedAnalysis(booking, queued) {
+    booking.aiStatus = "processing";
+    booking.aiError = "";
+    if (queued?.startedAt) booking.aiStartedAt = queued.startedAt;
+}
 dotenv.config()
 // console.log("acc sid ", process.env.TWILIO_ACCOUNT_SID)
 // console.log("acc auth ", process.env.TWILIO_AUTH_TOKEN)
@@ -135,7 +142,7 @@ export const handleSuccessfulPayment = async (req, res) => {
         await booking.save();
 
         try {
-            await analyzeAndStore(booking._id);
+            applyQueuedAnalysis(booking, await queueAnalysis(booking._id));
         } catch (err) {
             console.error("Failed to analyze booking:", err.message);
         }
@@ -226,7 +233,7 @@ export const updateHealthIssues = async (req, res) => {
         booking.unreadPatientUpdates = (booking.unreadPatientUpdates || 0) + 1;
         await booking.save();
         try {
-            await analyzeAndStore(booking._id);
+            applyQueuedAnalysis(booking, await queueAnalysis(booking._id));
         } catch (err) {
             console.error("Failed to re-analyze booking:", err.message);
         }
@@ -271,18 +278,171 @@ export const updateReports = async (req, res) => {
             });
         }
         booking.unreadPatientUpdates = (booking.unreadPatientUpdates || 0) + 1;
+        await booking.save();
         try {
-            await analyzeAndStore(booking._id);
+            applyQueuedAnalysis(booking, await queueAnalysis(booking._id));
         } catch (err) {
             console.error("Failed to re-analyze booking:", err.message);
         }
-        await booking.save();
 
 
         res.status(200).json({ success: true, message: "Reports updated", data: booking });
     } catch (err) {
         console.log(err.message);
         res.status(500).json({ success: false, message: "Error updating reports" });
+    }
+};
+
+const normalizePrescription = ({ diagnosis = "", medicines = [], notes = "" } = {}) => {
+    const cleanedMedicines = (Array.isArray(medicines) ? medicines : [])
+        .filter((medicine) => medicine && String(medicine.name || "").trim())
+        .map((medicine) => ({
+            name: String(medicine.name).trim(),
+            dosage: String(medicine.dosage || "").trim(),
+            frequency: String(medicine.frequency || "").trim(),
+            duration: String(medicine.duration || "").trim(),
+        }));
+
+    return {
+        diagnosis: String(diagnosis || "").trim(),
+        medicines: cleanedMedicines,
+        notes: String(notes || "").trim(),
+    };
+};
+
+const loadDoctorBooking = async (bookingId, doctorId) => {
+    const booking = await Booking.findById(bookingId).populate("doctor", "_id");
+    if (!booking) return { error: { status: 404, message: "Booking not found" } };
+    if (booking.doctor._id.toString() !== doctorId.toString()) {
+        return { error: { status: 403, message: "Not authorized" } };
+    }
+    if (booking.status === "completed" || booking.status === "cancelled") {
+        return { error: { status: 400, message: "Booking is closed" } };
+    }
+    return { booking };
+};
+
+export const addPrescription = async (req, res) => {
+    try {
+        const { bookingId } = req.params;
+        const { booking, error } = await loadDoctorBooking(bookingId, req.userId);
+        if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+        const prescription = normalizePrescription(req.body);
+        if (!prescription.diagnosis && prescription.medicines.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: "Add a diagnosis or at least one medicine",
+            });
+        }
+
+        booking.prescriptions.push({
+            ...prescription,
+            createdAt: new Date(),
+        });
+        booking.unreadDoctorResponses = (booking.unreadDoctorResponses || 0) + 1;
+
+        await booking.save();
+
+        res.status(200).json({
+            success: true,
+            message: "Prescription added",
+            data: booking,
+        });
+    } catch (err) {
+        console.error("Error in addPrescription:", err);
+        res.status(500).json({
+            success: false,
+            message: "Error adding prescription",
+            error: err.message,
+        });
+    }
+};
+
+export const updatePrescription = async (req, res) => {
+    try {
+        const { bookingId, prescriptionId } = req.params;
+        const { booking, error } = await loadDoctorBooking(bookingId, req.userId);
+        if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+        const prescription = booking.prescriptions.id(prescriptionId);
+        if (!prescription) {
+            return res.status(404).json({ success: false, message: "Prescription not found" });
+        }
+
+        const next = normalizePrescription(req.body);
+        if (!next.diagnosis && next.medicines.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: "Add a diagnosis or at least one medicine",
+            });
+        }
+
+        prescription.diagnosis = next.diagnosis;
+        prescription.medicines = next.medicines;
+        prescription.notes = next.notes;
+        prescription.updatedAt = new Date();
+        booking.unreadDoctorResponses = (booking.unreadDoctorResponses || 0) + 1;
+
+        await booking.save();
+
+        res.status(200).json({
+            success: true,
+            message: "Prescription updated",
+            data: booking,
+        });
+    } catch (err) {
+        console.error("Error in updatePrescription:", err);
+        res.status(500).json({
+            success: false,
+            message: "Error updating prescription",
+            error: err.message,
+        });
+    }
+};
+
+export const addPatientMessage = async (req, res) => {
+    try {
+        const { bookingId } = req.params;
+        const { response } = req.body;
+        const userId = req.userId;
+
+        if (!response || !String(response).trim()) {
+            return res.status(400).json({ success: false, message: "Message is required" });
+        }
+
+        const booking = await Booking.findById(bookingId);
+        if (!booking) {
+            return res.status(404).json({ success: false, message: "Booking not found" });
+        }
+
+        if (booking.user._id.toString() !== userId.toString()) {
+            return res.status(403).json({ success: false, message: "Not authorized" });
+        }
+
+        if (booking.status === "completed" || booking.status === "cancelled") {
+            return res.status(400).json({ success: false, message: "This booking is closed" });
+        }
+
+        booking.patientMessages.push({
+            text: String(response).trim(),
+            updatedAt: new Date(),
+        });
+        booking.unreadPatientUpdates = (booking.unreadPatientUpdates || 0) + 1;
+        await booking.save();
+
+        res.status(200).json({
+            success: true,
+            message: "Message sent",
+            data: booking,
+        });
+    } catch (err) {
+        console.error("Error in addPatientMessage:", err);
+        res.status(500).json({
+            success: false,
+            message: "Error sending message",
+            error: err.message,
+        });
     }
 };
 
@@ -332,25 +492,88 @@ export const addDoctorResponse = async (req, res) => {
     }
 };
 // Update getBookingDetails:
+const shapeVisit = (booking) => ({
+    _id: booking._id,
+    appointmentDate: booking.appointmentDate,
+    timeSlot: booking.timeSlot,
+    status: booking.status,
+    complaint: booking.currentHealthIssues || "",
+    prescriptions: booking.prescriptions || [],
+    reports: (booking.currentReports || []).map((group) => ({
+        name: group.name,
+        files: group.files || [],
+    })),
+});
+
+export const getPatientHistory = async (req, res) => {
+    try {
+        const doctorId = req.userId;
+        const { patientId } = req.params;
+        const exclude = req.query.exclude;
+
+        if (!mongoose.Types.ObjectId.isValid(patientId)) {
+            return res.status(400).json({ success: false, message: "Invalid patient" });
+        }
+
+        const query = {
+            doctor: doctorId,
+            user: patientId,
+            status: { $ne: "cancelled" },
+        };
+
+        if (exclude && mongoose.Types.ObjectId.isValid(exclude)) {
+            query._id = { $ne: exclude };
+            const current = await Booking.findOne({ _id: exclude, doctor: doctorId }).select("appointmentDate");
+            if (current?.appointmentDate) {
+                query.appointmentDate = { $lt: current.appointmentDate };
+            }
+        }
+
+        if (!query.appointmentDate) {
+            query.appointmentDate = { $lt: new Date() };
+        }
+
+        const bookings = await Booking.find(query).sort({ appointmentDate: -1 });
+
+        res.status(200).json({
+            success: true,
+            data: bookings.map(shapeVisit),
+        });
+    } catch (err) {
+        console.error("Error in getPatientHistory:", err);
+        res.status(500).json({ success: false, message: "Failed to load visit history" });
+    }
+};
+
 export const getBookingDetails = async (req, res) => {
     try {
         const role = req.role;
         const { bookingId } = req.params;
         const booking = await Booking.findById(bookingId)
-            .populate('user', 'name photo')
-            .populate('doctor', 'name photo');
+            .populate('user', 'name photo email phone age gender bloodType')
+            .populate('doctor', 'name photo specialization');
 
         if (!booking) {
             return res.status(404).json({ success: false, message: "Booking not found" });
         }
 
-        // Update last viewed timestamp
+        const viewedAt = new Date();
+        const consolidated = consolidateReports(booking.currentReports);
+        const viewedPatch = {};
         if (role === "patient") {
-            booking.lastViewedByPatient = new Date();
+            booking.lastViewedByPatient = viewedAt;
+            viewedPatch.lastViewedByPatient = viewedAt;
         } else if (role === "doctor") {
-            booking.lastViewedByDoctor = new Date();
+            booking.lastViewedByDoctor = viewedAt;
+            viewedPatch.lastViewedByDoctor = viewedAt;
         }
-        await booking.save();
+        if (consolidated.changed) {
+            booking.currentReports = consolidated.reports;
+            viewedPatch.currentReports = consolidated.reports;
+        }
+        if (Object.keys(viewedPatch).length > 0) {
+            await Booking.updateOne({ _id: bookingId }, { $set: viewedPatch });
+        }
 
         res.status(200).json({ success: true, data: booking });
     } catch (err) {
@@ -428,6 +651,66 @@ export const updateBookingStatus = async (req, res) => {
     }
 };
 
+const CANONICAL_REPORT_NAMES = {
+    xray: "X-Ray",
+    mri: "MRI",
+    ct: "CT Scan",
+    ultrasound: "Ultrasound",
+    "blood test": "Blood Test",
+    lab: "Lab Report",
+};
+
+function reportTypeKey(name) {
+    return String(name || "")
+        .toLowerCase()
+        .replace(/&/g, " and ")
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\b(scans?|reports?|images?|files?)\b/g, " ")
+        .replace(/\bx\s*rays?\b/g, "xray")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function canonicalReportName(name) {
+    const key = reportTypeKey(name);
+    if (CANONICAL_REPORT_NAMES[key]) return CANONICAL_REPORT_NAMES[key];
+    const cleaned = String(name || "")
+        .replace(/\b(scans?|reports?|images?|files?)\b/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    return cleaned || String(name || "").trim();
+}
+
+function consolidateReports(reports) {
+    const merged = [];
+    const indexByKey = new Map();
+    let changed = false;
+
+    (reports || []).forEach((group) => {
+        const originalName = group?.name || "";
+        const files = Array.isArray(group?.files) ? [...group.files] : [];
+        const key = reportTypeKey(originalName) || originalName.toLowerCase();
+        const label = canonicalReportName(originalName) || originalName;
+        const existingIndex = indexByKey.get(key);
+
+        if (existingIndex === undefined) {
+            if (label !== originalName) changed = true;
+            indexByKey.set(key, merged.length);
+            merged.push({ name: label, files });
+            return;
+        }
+
+        changed = true;
+        const target = merged[existingIndex];
+        files.forEach((file) => {
+            if (file && !target.files.includes(file)) target.files.push(file);
+        });
+    });
+
+    if ((reports || []).length !== merged.length) changed = true;
+    return { reports: merged, changed };
+}
+
 export const uploadReports = async (req, res) => {
     try {
         const { bookingId } = req.params;
@@ -438,12 +721,14 @@ export const uploadReports = async (req, res) => {
         if (!booking) return res.status(404).json({ message: "Booking not found" });
         if (booking.user._id.toString() !== userId.toString()) return res.status(403).json({ message: "Unauthorized" });
 
-        let group = booking.currentReports.find(r => r.name === name);
-        if (group) {
-            group.files.push(...urls);
-        } else {
-            booking.currentReports.push({ name, files: urls });
-        }
+        const label = canonicalReportName(name) || name;
+        booking.currentReports = consolidateReports([
+            ...(booking.currentReports || []).map((group) => ({
+                name: group.name,
+                files: [...(group.files || [])],
+            })),
+            { name: label, files: urls },
+        ]).reports;
 
         // Add to reportsHistory
         urls.forEach(url => {
@@ -457,6 +742,11 @@ export const uploadReports = async (req, res) => {
 
         booking.unreadPatientUpdates = (booking.unreadPatientUpdates || 0) + 1;
         await booking.save();
+        try {
+            applyQueuedAnalysis(booking, await queueAnalysis(booking._id));
+        } catch (err) {
+            console.error("Failed to analyze booking:", err.message);
+        }
 
         res.status(200).json({ success: true, message: "Reports saved", data: booking });
     } catch (err) {
@@ -478,7 +768,13 @@ export const renameReportGroup = async (req, res) => {
         const group = booking.currentReports.find(g => g.name === oldName);
         if (!group) return res.status(404).json({ message: "Group not found" });
 
-        group.name = newName;
+        const label = canonicalReportName(newName) || newName;
+        booking.currentReports = consolidateReports([
+            ...(booking.currentReports || [])
+                .filter((item) => item.name !== oldName)
+                .map((item) => ({ name: item.name, files: [...(item.files || [])] })),
+            { name: label, files: [...(group.files || [])] },
+        ]).reports;
 
         await booking.save();
         res.status(200).json({ success: true, message: "Group name updated", data: booking });

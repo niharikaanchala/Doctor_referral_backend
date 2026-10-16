@@ -2,6 +2,86 @@ import Doctor from "../models/DoctorSchema.js";
 import Booking from "../models/BookingSchema.js";
 import { addDays } from "date-fns";
 
+const shapeVisit = (booking) => ({
+  _id: booking._id,
+  appointmentDate: booking.appointmentDate,
+  timeSlot: booking.timeSlot,
+  status: booking.status,
+  complaint: booking.currentHealthIssues || "",
+  prescriptions: booking.prescriptions || [],
+  reports: (booking.currentReports || []).map((group) => ({
+    name: group.name,
+    files: group.files || [],
+  })),
+});
+
+export const getMyPatients = async (req, res) => {
+  try {
+    const doctorId = req.userId;
+    const bookings = await Booking.find({
+      doctor: doctorId,
+      status: { $ne: "cancelled" },
+    }).sort({ appointmentDate: -1 });
+
+    const byPatient = new Map();
+
+    for (const booking of bookings) {
+      const user = booking.user;
+      if (!user?._id) continue;
+      const id = user._id.toString();
+      if (!byPatient.has(id)) {
+        const src = typeof user.toObject === "function" ? user.toObject() : user;
+        const { password, appointments, role, ...profile } = src;
+        byPatient.set(id, { ...profile, visits: [] });
+      }
+      byPatient.get(id).visits.push(shapeVisit(booking));
+    }
+
+    const now = new Date();
+    const patients = [...byPatient.values()].map((patient) => {
+      const visits = [...patient.visits].sort(
+        (a, b) => new Date(b.appointmentDate) - new Date(a.appointmentDate)
+      );
+      const past = visits.filter(
+        (visit) => new Date(visit.appointmentDate) < now || visit.status === "completed"
+      );
+      const upcoming = visits
+        .filter((visit) => new Date(visit.appointmentDate) >= now && visit.status !== "completed")
+        .sort((a, b) => new Date(a.appointmentDate) - new Date(b.appointmentDate));
+      const last = past[0];
+      const next = upcoming[0];
+      const lastDiagnosis = (last?.prescriptions || []).map((item) => item.diagnosis).find(Boolean) || "";
+      const lastMedicines = (last?.prescriptions || [])
+        .flatMap((item) => item.medicines || [])
+        .map((medicine) => medicine.name)
+        .filter(Boolean);
+      let status = "New";
+      if (past.length && upcoming.length) status = "Follow-up";
+      else if (past.length) status = "Active";
+
+      return {
+        ...patient,
+        visits,
+        visitCount: visits.length,
+        lastVisit: last?.appointmentDate || null,
+        nextAppointment: next?.appointmentDate || null,
+        lastDiagnosis,
+        lastMedicines,
+        status,
+      };
+    });
+
+    patients.sort(
+      (a, b) => new Date(b.lastVisit || b.visits[0]?.appointmentDate || 0) - new Date(a.lastVisit || a.visits[0]?.appointmentDate || 0)
+    );
+
+    res.status(200).json({ success: true, data: patients });
+  } catch (err) {
+    console.error("Error in getMyPatients:", err);
+    res.status(500).json({ success: false, message: "Failed to load patients" });
+  }
+};
+
 
 
 export const updateDoctor = async (req, res) => {
